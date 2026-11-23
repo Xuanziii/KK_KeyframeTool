@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Xml;
 using BepInEx;
@@ -9,7 +8,6 @@ using ExtensibleSaveFormat;
 using KKAPI;
 using KKAPI.Studio;
 using KKAPI.Studio.SaveLoad;
-using KKAPI.Studio.UI;
 using KKAPI.Utilities;
 using Studio;
 using UnityEngine;
@@ -29,36 +27,30 @@ namespace KeyframeToolPlugin
 
         public static KeyframeTool Instance { get; private set; }
 
-        // 獨立設定與快捷鍵（不與原版 Timeline 衝突）
         private ConfigEntry<KeyboardShortcut> _toggleWindowKey;
         private ConfigEntry<KeyboardShortcut> _playPauseKey;
         private ConfigEntry<bool> _darkMode;
 
-        // UI 視窗與播放狀態
         private bool _showWindow = false;
         private Rect _windowRect = new Rect(120, 120, 780, 460);
         private Vector2 _trackScrollPos = Vector2.zero;
         private Vector2 _inspectorScrollPos = Vector2.zero;
 
-        // 時間軸核心參數
         private float _playbackTime = 0f;
         private float _duration = 10f;
         private bool _isPlaying = false;
         private bool _loop = true;
 
-        // 精準數值輸入暫存字串（避免滑桿拖曳誤差）
         private string _timeInputStr = "0.000";
         private string _durationInputStr = "10.000";
         private string _posXStr = "0", _posYStr = "0", _posZStr = "0";
         private string _rotXStr = "0", _rotYStr = "0", _rotZStr = "0";
         private string _scaleXStr = "1", _scaleYStr = "1", _scaleZStr = "1";
 
-        // 獨立關鍵影格資料結構
         private readonly Dictionary<int, ObjectTrack> _tracks = new Dictionary<int, ObjectTrack>();
         private int _selectedTrackId = -1;
         private int _selectedKeyframeIndex = -1;
 
-        private Texture2D _toolbarIcon;
         private GUIStyle _headerStyle;
         private GUIStyle _boxStyle;
 
@@ -70,31 +62,7 @@ namespace KeyframeToolPlugin
             _playPauseKey = Config.Bind("Hotkeys", "Play / Pause", new KeyboardShortcut(KeyCode.Space, KeyCode.LeftControl), "播放或暫停 KeyframeTool 時間軸");
             _darkMode = Config.Bind("Appearance", "Dark Mode", true, "切換深色 / 淺色極簡介面主題");
 
-            StudioAPI.StudioLoadedChanged += OnStudioLoaded;
             StudioSaveLoadApi.RegisterExtraBehaviour<KeyframeToolSceneController>(ExtDataKey);
-        }
-
-        private void OnStudioLoaded(object sender, EventArgs e)
-        {
-            if (!StudioAPI.InsideStudio) return;
-
-            // 建立 32x32 工具列圖示
-            _toolbarIcon = new Texture2D(32, 32, TextureFormat.ARGB32, false);
-            Color fill = new Color(0.25f, 0.65f, 0.95f, 1f);
-            Color border = new Color(0.1f, 0.1f, 0.12f, 1f);
-            for (int y = 0; y < 32; y++)
-            {
-                for (int x = 0; x < 32; x++)
-                {
-                    bool isBorder = x < 2 || x > 29 || y < 2 || y > 29;
-                    bool isDiamond = Mathf.Abs(x - 16) + Mathf.Abs(y - 16) < 8;
-                    _toolbarIcon.SetPixel(x, y, isBorder ? border : (isDiamond ? Color.white : fill));
-                }
-            }
-            _toolbarIcon.Apply();
-
-            var toggle = StudioAPI.AddLeftToolbarToggle(_toolbarIcon, state => _showWindow = state);
-            toggle.Value = _showWindow;
         }
 
         private void Update()
@@ -127,7 +95,15 @@ namespace KeyframeToolPlugin
 
         private void OnGUI()
         {
-            if (!StudioAPI.InsideStudio || !_showWindow) return;
+            if (!StudioAPI.InsideStudio) return;
+
+            // 當視窗關閉時，在畫面上方提供一個小按鈕方便滑鼠點擊開啟（也可直接按 Ctrl+K）
+            if (!_showWindow)
+            {
+                if (GUI.Button(new Rect(10, 10, 115, 24), "KeyframeTool"))
+                    _showWindow = true;
+                return;
+            }
 
             InitStyles();
 
@@ -164,7 +140,6 @@ namespace KeyframeToolPlugin
 
         private void DrawMainWindow(int id)
         {
-            // 頂部工具列：播放控制與精準時間輸入
             GUILayout.BeginHorizontal(_boxStyle);
             if (GUILayout.Button(_isPlaying ? "❚❚ Pause" : "▶ Play", GUILayout.Width(75)))
                 _isPlaying = !_isPlaying;
@@ -204,10 +179,9 @@ namespace KeyframeToolPlugin
                 _showWindow = false;
             GUILayout.EndHorizontal();
 
-            // 主工作區：左側為物件軌道清單，右側為精準關鍵影格屬性檢查器
             GUILayout.BeginHorizontal();
 
-            // --- 左側面板：軌道與關鍵影格 ---
+            // 左側面板：軌道與關鍵影格
             GUILayout.BeginVertical(_boxStyle, GUILayout.Width(450), GUILayout.ExpandHeight(true));
             GUILayout.BeginHorizontal();
             GUILayout.Label("Object Tracks", _headerStyle);
@@ -245,7 +219,6 @@ namespace KeyframeToolPlugin
                 }
                 GUILayout.EndHorizontal();
 
-                // 顯示該軌道的關鍵影格時間點按鈕
                 if (track.Keyframes.Count > 0)
                 {
                     GUILayout.BeginHorizontal();
@@ -272,7 +245,7 @@ namespace KeyframeToolPlugin
             GUILayout.EndScrollView();
             GUILayout.EndVertical();
 
-            // --- 右側面板：After Effects 風格精準數值檢查器 ---
+            // 右側面板：精準數值檢查器
             GUILayout.BeginVertical(_boxStyle, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
             GUILayout.Label("Keyframe Inspector (Numeric)", _headerStyle);
             _inspectorScrollPos = GUILayout.BeginScrollView(_inspectorScrollPos);
@@ -447,154 +420,4 @@ namespace KeyframeToolPlugin
             }
         }
 
-        private void ApplyTransform(Transform target, KeyframeData kf)
-        {
-            target.localPosition = kf.Position;
-            target.localEulerAngles = kf.Rotation;
-            target.localScale = kf.Scale;
-        }
-
-        // --- 場景獨立存檔序列化（使用專屬 ExtDataKey，不與 Timeline 衝突） ---
-        public PluginData SaveSceneData()
-        {
-            if (_tracks.Count == 0) return null;
-
-            var doc = new XmlDocument();
-            XmlElement root = doc.CreateElement("KeyframeTool");
-            root.SetAttribute("duration", _duration.ToString("R"));
-            doc.AppendChild(root);
-
-            foreach (var track in _tracks.Values)
-            {
-                XmlElement trackNode = doc.CreateElement("Track");
-                trackNode.SetAttribute("id", track.ObjectId.ToString());
-                trackNode.SetAttribute("name", track.Name);
-                foreach (var kf in track.Keyframes)
-                {
-                    XmlElement keyNode = doc.CreateElement("Key");
-                    keyNode.SetAttribute("t", kf.Time.ToString("R"));
-                    keyNode.SetAttribute("px", kf.Position.x.ToString("R"));
-                    keyNode.SetAttribute("py", kf.Position.y.ToString("R"));
-                    keyNode.SetAttribute("pz", kf.Position.z.ToString("R"));
-                    keyNode.SetAttribute("rx", kf.Rotation.x.ToString("R"));
-                    keyNode.SetAttribute("ry", kf.Rotation.y.ToString("R"));
-                    keyNode.SetAttribute("rz", kf.Rotation.z.ToString("R"));
-                    keyNode.SetAttribute("sx", kf.Scale.x.ToString("R"));
-                    keyNode.SetAttribute("sy", kf.Scale.y.ToString("R"));
-                    keyNode.SetAttribute("sz", kf.Scale.z.ToString("R"));
-                    keyNode.SetAttribute("ease", ((int)kf.Easing).ToString());
-                    trackNode.AppendChild(keyNode);
-                }
-                root.AppendChild(trackNode);
-            }
-
-            var data = new PluginData();
-            data.data["xml"] = doc.OuterXml;
-            return data;
-        }
-
-        public void LoadSceneData(PluginData data, ReadOnlyDictionary<int, ObjectCtrlInfo> loadedObjects)
-        {
-            _tracks.Clear();
-            _selectedTrackId = -1;
-            _selectedKeyframeIndex = -1;
-
-            if (data == null || !data.data.TryGetValue("xml", out object xmlObj) || !(xmlObj is string xmlStr))
-                return;
-
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlStr);
-            XmlElement root = doc.DocumentElement;
-            if (root == null) return;
-
-            if (float.TryParse(root.GetAttribute("duration"), out float dur))
-            {
-                _duration = dur;
-                _durationInputStr = _duration.ToString("F3");
-            }
-
-            foreach (XmlElement trackNode in root.GetElementsByTagName("Track"))
-            {
-                if (!int.TryParse(trackNode.GetAttribute("id"), out int origId)) continue;
-                if (!loadedObjects.TryGetValue(origId, out ObjectCtrlInfo oci) || oci?.guideObject?.transformTarget == null)
-                    continue;
-
-                var track = new ObjectTrack
-                {
-                    ObjectId = oci.objectInfo.dicKey,
-                    Name = trackNode.GetAttribute("name"),
-                    Target = oci.guideObject.transformTarget
-                };
-
-                foreach (XmlElement keyNode in trackNode.GetElementsByTagName("Key"))
-                {
-                    var kf = new KeyframeData
-                    {
-                        Time = float.Parse(keyNode.GetAttribute("t")),
-                        Position = new Vector3(
-                            float.Parse(keyNode.GetAttribute("px")),
-                            float.Parse(keyNode.GetAttribute("py")),
-                            float.Parse(keyNode.GetAttribute("pz"))),
-                        Rotation = new Vector3(
-                            float.Parse(keyNode.GetAttribute("rx")),
-                            float.Parse(keyNode.GetAttribute("ry")),
-                            float.Parse(keyNode.GetAttribute("rz"))),
-                        Scale = new Vector3(
-                            float.Parse(keyNode.GetAttribute("sx")),
-                            float.Parse(keyNode.GetAttribute("sy")),
-                            float.Parse(keyNode.GetAttribute("sz"))),
-                        Easing = (EasingMode)int.Parse(keyNode.GetAttribute("ease"))
-                    };
-                    track.Keyframes.Add(kf);
-                }
-
-                track.Keyframes.Sort((a, b) => a.Time.CompareTo(b.Time));
-                _tracks[track.ObjectId] = track;
-            }
-        }
-    }
-
-    public class KeyframeToolSceneController : SceneCustomFunctionController
-    {
-        protected override void OnSceneSave()
-        {
-            PluginData data = KeyframeTool.Instance?.SaveSceneData();
-            SetExtendedData(data);
-        }
-
-        protected override void OnSceneLoad(SceneOperationKind operation, ReadOnlyDictionary<int, ObjectCtrlInfo> loadedItems)
-        {
-            if (operation == SceneOperationKind.Clear)
-            {
-                KeyframeTool.Instance?.LoadSceneData(null, loadedItems);
-                return;
-            }
-            PluginData data = GetExtendedData();
-            KeyframeTool.Instance?.LoadSceneData(data, loadedItems);
-        }
-    }
-
-    public class ObjectTrack
-    {
-        public int ObjectId;
-        public string Name;
-        public Transform Target;
-        public List<KeyframeData> Keyframes = new List<KeyframeData>();
-    }
-
-    public class KeyframeData
-    {
-        public float Time;
-        public Vector3 Position;
-        public Vector3 Rotation;
-        public Vector3 Scale = Vector3.one;
-        public EasingMode Easing = EasingMode.Linear;
-    }
-
-    public enum EasingMode
-    {
-        Linear = 0,
-        EaseInOut = 1,
-        Hold = 2
-    }
-}
+        private

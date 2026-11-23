@@ -22,7 +22,7 @@ namespace KeyframeToolPlugin
     {
         public const string GUID = "com.custom.koikatsu.keyframetool";
         public const string PluginName = "KeyframeTool";
-        public const string Version = "4.0.0";
+        public const string Version = "5.0.0";
         public const string ExtDataKey = "KeyframeToolData";
 
         public static KeyframeTool Instance { get; private set; }
@@ -31,9 +31,9 @@ namespace KeyframeToolPlugin
         private ConfigEntry<KeyboardShortcut> _playPauseKey;
         private ConfigEntry<bool> _darkMode;
 
-        // 視窗與版面配置
+        // 視窗與版面配置（支援右下角自由拖曳縮放）
         private bool _showWindow = true;
-        private Rect _windowRect = new Rect(40, 460, 1200, 410);
+        private Rect _windowRect = new Rect(40, 440, 1200, 420);
         private Vector2 _trackScrollPos = Vector2.zero;
         private Vector2 _inspectorScrollPos = Vector2.zero;
 
@@ -47,19 +47,37 @@ namespace KeyframeToolPlugin
         private bool _autoKey = false;
         private bool _graphEditorMode = false;
 
-        // 拖曳互動狀態
+        // 拖曳與框選互動狀態
         private bool _isScrubbingRuler = false;
         private bool _isDraggingScrollbar = false;
         private float _scrollbarDragOffset = 0f;
-        private SubTrack _draggingSubTrack = null;
-        private KeyframeData _draggingKey = null;
+        private bool _isResizingWindow = false;
+        private Vector2 _resizeStartMouse = Vector2.zero;
+        private Vector2 _resizeStartSize = Vector2.zero;
+
+        // 關鍵影格整批拖曳 / Time-Stretch 狀態
+        private bool _isDraggingKeys = false;
+        private bool _isTimeStretching = false;
+        private float _dragStartTime = 0f;
+        private float _stretchAnchorTime = 0f;
+        private float _stretchInitialSpan = 0f;
+        private readonly Dictionary<KeyframeData, float> _dragInitialTimes = new Dictionary<KeyframeData, float>();
+
+        // 框選（Marquee Selection）狀態（以 ScrollView 內容座標記錄）
+        private bool _isMarqueeSelecting = false;
+        private Vector2 _marqueeStartContent = Vector2.zero;
+        private Vector2 _marqueeCurrentContent = Vector2.zero;
+        private bool _marqueeShiftAdditive = false;
+
+        // Graph Editor 切線拖曳狀態
         private int _draggingHandleType = 0; // 0: 無, 1: OutHandle, 2: InHandle
 
-        // 選取與剪貼簿
+        // 多重選取與跨軌道剪貼簿
         private ObjectTrack _selectedRootTrack = null;
         private SubTrack _selectedSubTrack = null;
-        private KeyframeData _selectedKey = null;
-        private KeyframeData _clipboardKey = null;
+        private KeyframeData _primarySelectedKey = null;
+        private readonly HashSet<KeyframeData> _selectedKeys = new HashSet<KeyframeData>();
+        private readonly List<ClipboardKeyEntry> _clipboardEntries = new List<ClipboardKeyEntry>();
 
         // 精準數值輸入框
         private string _timeInputStr = "0.00";
@@ -81,13 +99,15 @@ namespace KeyframeToolPlugin
         private const float RulerHeight = 28f;
         private const float TrackRowHeight = 28f;
         private const float BottomScrollbarHeight = 18f;
+        private const float MinWindowWidth = 860f;
+        private const float MinWindowHeight = 260f;
 
         private void Awake()
         {
             Instance = this;
 
             _toggleWindowKey = Config.Bind("Hotkeys", "Toggle KeyframeTool Window", new KeyboardShortcut(KeyCode.K, KeyCode.LeftControl), "開啟或關閉 KeyframeTool 時間軸視窗");
-            _playPauseKey = Config.Bind("Hotkeys", "Play / Pause", new KeyboardShortcut(KeyCode.Space, KeyCode.LeftControl), "播放或暫停時間軸");
+            _playPauseKey = Config.Bind("Hotkeys", "Play / Pause", new KeyboardShortcut(KeyCode.P, KeyCode.LeftControl), "播放或暫停時間軸（預設 Ctrl+P，避免與 Studio 空白鍵衝突）");
             _darkMode = Config.Bind("Appearance", "Dark Mode", true, "深色 / 淺色主題切換");
 
             _whiteTex = new Texture2D(1, 1);
@@ -109,7 +129,7 @@ namespace KeyframeToolPlugin
 
             UpdateCameraLock();
 
-            if (_autoKey && !_isPlaying && !_isScrubbingRuler && _draggingKey == null && _draggingHandleType == 0)
+            if (_autoKey && !_isPlaying && !_isScrubbingRuler && !_isDraggingKeys && _draggingHandleType == 0)
             {
                 CheckAutoKeyChanges();
             }
@@ -139,9 +159,9 @@ namespace KeyframeToolPlugin
 
             Vector2 guiMousePos = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
             bool pointerOverUI = _showWindow && _windowRect.Contains(guiMousePos);
-            bool isDraggingTimeline = _isScrubbingRuler || _isDraggingScrollbar || _draggingKey != null || _draggingHandleType != 0;
+            bool isInteracting = _isScrubbingRuler || _isDraggingScrollbar || _isDraggingKeys || _isMarqueeSelecting || _isResizingWindow || _draggingHandleType != 0;
 
-            if (pointerOverUI || isDraggingTimeline)
+            if (pointerOverUI || isInteracting)
             {
                 if (studio.cameraCtrl.enabled)
                 {
@@ -210,6 +230,10 @@ namespace KeyframeToolPlugin
                 return;
             }
 
+            // 處理全視窗級拖曳縮放（Window Resizing）
+            HandleGlobalWindowResize();
+
+            // 處理 AE 快捷鍵（Delete 刪除、Ctrl+C/V 複製貼上、F9 Easy Ease）
             HandleTimelineKeyboardEvents();
 
             bool dark = _darkMode.Value;
@@ -219,56 +243,176 @@ namespace KeyframeToolPlugin
             GUI.backgroundColor = dark ? new Color(0.14f, 0.14f, 0.16f, 0.98f) : new Color(0.92f, 0.92f, 0.94f, 0.98f);
             GUI.contentColor = dark ? new Color(0.90f, 0.91f, 0.93f, 1f) : new Color(0.12f, 0.12f, 0.14f, 1f);
 
+            _windowRect.width = Mathf.Clamp(_windowRect.width, MinWindowWidth, Screen.width);
+            _windowRect.height = Mathf.Clamp(_windowRect.height, MinWindowHeight, Screen.height);
             _windowRect.x = Mathf.Clamp(_windowRect.x, 0, Mathf.Max(0, Screen.width - _windowRect.width));
             _windowRect.y = Mathf.Clamp(_windowRect.y, 0, Mathf.Max(0, Screen.height - _windowRect.height));
 
-            _windowRect = GUI.Window(948724, _windowRect, DrawAEWorkspaceWindow, "KeyframeTool — AE Multi-Track & Graph Editor");
+            _windowRect = GUI.Window(948725, _windowRect, DrawAEWorkspaceWindow, "KeyframeTool — AE Multi-Track & Graph Editor");
 
             if (Event.current.rawType == EventType.MouseUp)
             {
                 _isScrubbingRuler = false;
                 _isDraggingScrollbar = false;
-                _draggingKey = null;
-                _draggingSubTrack = null;
+                _isDraggingKeys = false;
+                _isTimeStretching = false;
+                _isMarqueeSelecting = false;
+                _isResizingWindow = false;
                 _draggingHandleType = 0;
+                _dragInitialTimes.Clear();
             }
 
             GUI.backgroundColor = prevBg;
             GUI.contentColor = prevContent;
         }
 
+        private void HandleGlobalWindowResize()
+        {
+            Event e = Event.current;
+            if (_isResizingWindow)
+            {
+                if (e.type == EventType.MouseDrag)
+                {
+                    Vector2 delta = e.mousePosition - _resizeStartMouse;
+                    _windowRect.width = Mathf.Clamp(_resizeStartSize.x + delta.x, MinWindowWidth, Screen.width - _windowRect.x);
+                    _windowRect.height = Mathf.Clamp(_resizeStartSize.y + delta.y, MinWindowHeight, Screen.height - _windowRect.y);
+                    e.Use();
+                }
+                else if (e.rawType == EventType.MouseUp)
+                {
+                    _isResizingWindow = false;
+                    e.Use();
+                }
+            }
+        }
+
+        private void ClearKeySelection()
+        {
+            _selectedKeys.Clear();
+            _primarySelectedKey = null;
+        }
+
+        private void SelectSingleKey(SubTrack sub, KeyframeData kf)
+        {
+            _selectedKeys.Clear();
+            _selectedKeys.Add(kf);
+            _selectedSubTrack = sub;
+            _primarySelectedKey = kf;
+            LoadKeyframeToInputs(kf);
+        }
+
+        private void ToggleKeyInSelection(SubTrack sub, KeyframeData kf)
+        {
+            if (_selectedKeys.Contains(kf))
+            {
+                _selectedKeys.Remove(kf);
+                if (_primarySelectedKey == kf)
+                    _primarySelectedKey = _selectedKeys.FirstOrDefault();
+            }
+            else
+            {
+                _selectedKeys.Add(kf);
+                _selectedSubTrack = sub;
+                _primarySelectedKey = kf;
+                LoadKeyframeToInputs(kf);
+            }
+        }
+
         private void HandleTimelineKeyboardEvents()
         {
             Event e = Event.current;
             if (e.type != EventType.KeyDown) return;
+
+            // 若正在文字輸入框打字則不攔截
             if (GUI.GetNameOfFocusedControl().StartsWith("NumInput")) return;
 
-            if ((e.keyCode == KeyCode.Delete || e.keyCode == KeyCode.Backspace) && _selectedKey != null && _selectedSubTrack != null)
+            // 1. Delete / Backspace：刪除所有已選取關鍵影格
+            if ((e.keyCode == KeyCode.Delete || e.keyCode == KeyCode.Backspace) && _selectedKeys.Count > 0)
             {
-                _selectedSubTrack.Keyframes.Remove(_selectedKey);
-                _selectedKey = null;
+                foreach (var root in _tracks.Values)
+                {
+                    foreach (var sub in root.SubTracks)
+                    {
+                        sub.Keyframes.RemoveAll(k => _selectedKeys.Contains(k));
+                    }
+                }
+                ClearKeySelection();
                 e.Use();
             }
-            else if (e.control && e.keyCode == KeyCode.C && _selectedKey != null)
+            // 2. Ctrl + C：複製所有已選取關鍵影格（支援跨軌道與相對時間保留）
+            else if (e.control && e.keyCode == KeyCode.C && _selectedKeys.Count > 0)
             {
-                _clipboardKey = _selectedKey.Clone();
+                _clipboardEntries.Clear();
+                float minTime = _selectedKeys.Min(k => k.Time);
+
+                foreach (var root in _tracks.Values)
+                {
+                    foreach (var sub in root.SubTracks)
+                    {
+                        foreach (var kf in sub.Keyframes)
+                        {
+                            if (_selectedKeys.Contains(kf))
+                            {
+                                _clipboardEntries.Add(new ClipboardKeyEntry
+                                {
+                                    RootObjectId = root.ObjectId,
+                                    SubTrackKey = sub.TrackKey,
+                                    RelativeTimeOffset = kf.Time - minTime,
+                                    Data = kf.Clone()
+                                });
+                            }
+                        }
+                    }
+                }
                 e.Use();
             }
-            else if (e.control && e.keyCode == KeyCode.V && _clipboardKey != null && _selectedSubTrack != null)
+            // 3. Ctrl + V：在當前播放頭位置貼上整組已複製關鍵影格
+            else if (e.control && e.keyCode == KeyCode.V && _clipboardEntries.Count > 0)
             {
-                var pasted = _clipboardKey.Clone();
-                pasted.Time = _playbackTime;
-                _selectedSubTrack.Keyframes.RemoveAll(k => Mathf.Abs(k.Time - _playbackTime) < 0.005f);
-                _selectedSubTrack.Keyframes.Add(pasted);
-                _selectedSubTrack.Keyframes.Sort((a, b) => a.Time.CompareTo(b.Time));
-                _selectedKey = pasted;
-                LoadKeyframeToInputs(pasted);
+                ClearKeySelection();
+                foreach (var entry in _clipboardEntries)
+                {
+                    if (!_tracks.TryGetValue(entry.RootObjectId, out ObjectTrack root)) continue;
+                    SubTrack targetSub = root.SubTracks.FirstOrDefault(s => s.TrackKey == entry.SubTrackKey);
+                    if (targetSub == null) continue;
+
+                    float pasteTime = Mathf.Clamp(_playbackTime + entry.RelativeTimeOffset, 0f, _duration);
+                    KeyframeData pasted = entry.Data.Clone();
+                    pasted.Time = pasteTime;
+
+                    targetSub.Keyframes.RemoveAll(k => Mathf.Abs(k.Time - pasteTime) < 0.005f);
+                    targetSub.Keyframes.Add(pasted);
+                    targetSub.Keyframes.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+                    _selectedKeys.Add(pasted);
+                    _selectedSubTrack = targetSub;
+                    _primarySelectedKey = pasted;
+                }
+                if (_primarySelectedKey != null)
+                    LoadKeyframeToInputs(_primarySelectedKey);
+
+                EvaluateAllTracks(_playbackTime);
+                e.Use();
+            }
+            // 4. F9：AE Easy Ease（批次柔和漸變曲線）
+            else if (e.keyCode == KeyCode.F9 && _selectedKeys.Count > 0)
+            {
+                foreach (var kf in _selectedKeys)
+                {
+                    kf.Easing = EasingMode.EaseInOut;
+                    kf.OutInfluence = 0.33f;
+                    kf.OutTangentValue = 0.0f;
+                    kf.InInfluence = 0.33f;
+                    kf.InTangentValue = 1.0f;
+                }
+                if (_primarySelectedKey != null)
+                    LoadKeyframeToInputs(_primarySelectedKey);
                 EvaluateAllTracks(_playbackTime);
                 e.Use();
             }
         }
 
-        // === 時間與畫面 X 座標雙向換算（支援 Zoom 與 ViewStartRatio） ===
+        // === 時間與畫面 X 座標雙向換算 ===
         private float VisibleWindowRatio => 1f / Mathf.Max(1f, _zoomLevel);
         private float MaxViewStartRatio => Mathf.Max(0f, 1f - VisibleWindowRatio);
 
@@ -292,7 +436,6 @@ namespace KeyframeToolPlugin
             float oldVisible = VisibleWindowRatio;
             float newVisible = 1f / clampedZoom;
 
-            // 以游標位置為基準點縮放，避免畫面跳走
             float anchorScreenRatio = Mathf.Clamp01((anchorNormalizedTime - _viewStartRatio) / oldVisible);
             _zoomLevel = clampedZoom;
             _viewStartRatio = Mathf.Clamp(anchorNormalizedTime - anchorScreenRatio * newVisible, 0f, MaxViewStartRatio);
@@ -324,7 +467,6 @@ namespace KeyframeToolPlugin
             _autoKey = GUILayout.Toggle(_autoKey, "● Auto-Key", GUI.skin.button, GUILayout.Width(82));
             GUI.backgroundColor = oldBg;
 
-            // Graph Editor 模式切換按鈕
             if (_graphEditorMode) GUI.backgroundColor = new Color(0.22f, 0.65f, 1f, 1f);
             _graphEditorMode = GUILayout.Toggle(_graphEditorMode, "📈 Graph", GUI.skin.button, GUILayout.Width(72));
             GUI.backgroundColor = oldBg;
@@ -347,14 +489,11 @@ namespace KeyframeToolPlugin
                 _durationInputStr = _duration.ToString("F2");
             }
 
-            // Zoom 倍率直接輸入框（避免使用滑桿）
             GUILayout.Label("Zoom:", GUILayout.Width(38));
             GUI.SetNextControlName("NumInput_Zoom");
             _zoomInputStr = GUILayout.TextField(_zoomInputStr, GUILayout.Width(42));
             if (GUILayout.Button("x", GUILayout.Width(22)) && float.TryParse(_zoomInputStr, out float zVal))
-            {
                 ApplyZoom(zVal, _playbackTime / Mathf.Max(0.001f, _duration));
-            }
 
             GUILayout.Space(6);
             if (GUILayout.Button("+ 加入選取物件/角色", GUILayout.Width(140)))
@@ -374,7 +513,7 @@ namespace KeyframeToolPlugin
             float laneWidth = timelineAreaWidth - 16f;
             float trackAreaHeight = bodyRect.height - RulerHeight - BottomScrollbarHeight - 4f;
 
-            // 支援 Alt + 滑鼠滾輪縮放時間軸
+            // Alt + 滑鼠滾輪縮放時間軸
             Rect timelineInteractZone = new Rect(bodyRect.x + LeftHeaderWidth, bodyRect.y, laneWidth, RulerHeight + trackAreaHeight);
             Event e = Event.current;
             if (e.type == EventType.ScrollWheel && e.alt && timelineInteractZone.Contains(e.mousePosition))
@@ -393,19 +532,15 @@ namespace KeyframeToolPlugin
             Rect rulerRect = new Rect(bodyRect.x + LeftHeaderWidth, bodyRect.y, timelineAreaWidth, RulerHeight);
             DrawTimelineRuler(rulerRect, laneWidth, dark);
 
-            // --- 2B. 中央主視圖：Dope Sheet 多軌道 或 Graph Editor 曲線圖表 ---
+            // --- 2B. 中央主視圖：Dope Sheet 多軌道 或 Graph Editor ---
             Rect centerOuterRect = new Rect(bodyRect.x, bodyRect.y + RulerHeight, LeftHeaderWidth + timelineAreaWidth, trackAreaHeight);
 
             if (_graphEditorMode)
-            {
                 DrawGraphEditorView(centerOuterRect, laneWidth, dark);
-            }
             else
-            {
                 DrawDopeSheetView(centerOuterRect, laneWidth, dark);
-            }
 
-            // 時間尺頂端藍色倒三角指標（僅在可見視窗範圍內繪製）
+            // 時間尺頂端藍色倒三角指標
             float headerPlayheadX = TimeToLaneX(_playbackTime, rulerRect.x, laneWidth);
             if (headerPlayheadX >= rulerRect.x && headerPlayheadX <= rulerRect.x + laneWidth)
             {
@@ -413,7 +548,7 @@ namespace KeyframeToolPlugin
                 DrawRect(new Rect(headerPlayheadX - 1f, rulerRect.y + 14, 2f, RulerHeight - 14), new Color(0.22f, 0.65f, 1f, 1f));
             }
 
-            // --- 2C. 底部時間軸水平縮放捲動條（Timeline Zoom Scrollbar） ---
+            // --- 2C. 底部時間軸水平縮放捲動條 ---
             Rect scrollbarTrackRect = new Rect(bodyRect.x + LeftHeaderWidth, bodyRect.y + RulerHeight + trackAreaHeight + 2f, laneWidth, BottomScrollbarHeight);
             DrawTimelineZoomScrollbar(scrollbarTrackRect, dark);
 
@@ -421,7 +556,31 @@ namespace KeyframeToolPlugin
             Rect inspectorRect = new Rect(bodyRect.x + LeftHeaderWidth + timelineAreaWidth + 6f, bodyRect.y, inspectorWidth, bodyRect.height);
             DrawNumericInspector(inspectorRect, dark);
 
-            GUI.DragWindow(new Rect(0, 0, _windowRect.width, 22));
+            // --- 2E. 右下角視窗自由縮放控制點（Resize Grip） ---
+            Rect resizeGripRect = new Rect(_windowRect.width - 18f, _windowRect.height - 18f, 18f, 18f);
+            DrawWindowResizeGrip(resizeGripRect, dark);
+
+            // 僅允許拖曳視窗最頂端標題列（高度 22px）移動視窗
+            GUI.DragWindow(new Rect(0, 0, _windowRect.width - 24f, 22));
+        }
+
+        private void DrawWindowResizeGrip(Rect gripRect, bool dark)
+        {
+            Color gripCol = dark ? new Color(0.55f, 0.58f, 0.65f, 0.9f) : new Color(0.35f, 0.38f, 0.45f, 0.9f);
+            // 繪製三條斜向縮放識別線
+            DrawLine(new Vector2(gripRect.x + 12, gripRect.y + 16), new Vector2(gripRect.x + 16, gripRect.y + 12), 1.5f, gripCol);
+            DrawLine(new Vector2(gripRect.x + 8, gripRect.y + 16), new Vector2(gripRect.x + 16, gripRect.y + 8), 1.5f, gripCol);
+            DrawLine(new Vector2(gripRect.x + 4, gripRect.y + 16), new Vector2(gripRect.x + 16, gripRect.y + 4), 1.5f, gripCol);
+
+            Event e = Event.current;
+            if (e.type == EventType.MouseDown && e.button == 0 && gripRect.Contains(e.mousePosition))
+            {
+                _isResizingWindow = true;
+                // 轉換為螢幕全域滑鼠座標以確保連續拖曳平滑不抖動
+                _resizeStartMouse = GUIUtility.GUIToScreenPoint(e.mousePosition);
+                _resizeStartSize = new Vector2(_windowRect.width, _windowRect.height);
+                e.Use();
+            }
         }
 
         private void DrawTimelineZoomScrollbar(Rect trackRect, bool dark)
@@ -476,6 +635,9 @@ namespace KeyframeToolPlugin
 
             _trackScrollPos = GUI.BeginScrollView(outerRect, _trackScrollPos, viewRect);
 
+            // 記錄每個可繪製菱形的命中框，用於框選判定
+            var allDiamondEntries = new List<RenderedDiamondInfo>();
+
             int currentRow = 0;
             foreach (var kvp in _tracks.ToList())
             {
@@ -499,12 +661,20 @@ namespace KeyframeToolPlugin
                         Rect subLeft = new Rect(0, subY, LeftHeaderWidth, TrackRowHeight - 1);
                         Rect subLane = new Rect(LeftHeaderWidth, subY, laneWidth, TrackRowHeight - 1);
 
-                        DrawSubTrackRow(rootTrack, sub, subLeft, subLane, dark, currentRow % 2 == 0);
+                        DrawSubTrackRow(rootTrack, sub, subLeft, subLane, laneWidth, dark, currentRow % 2 == 0, allDiamondEntries);
                         currentRow++;
                     }
                 }
             }
 
+            // 處理整批關鍵影格拖曳（Group Drag）與 Alt + 拖曳最外側時間伸縮（Time-Stretch）
+            HandleMultiKeyDragging(laneWidth);
+
+            // 處理關鍵影格製作區域（右側軌道背景）的點擊取消選取與滑鼠框選（Marquee Selection）
+            Rect keyframeProductionZone = new Rect(LeftHeaderWidth, 0, laneWidth, contentHeight);
+            HandleMarqueeAndBackgroundClick(keyframeProductionZone, allDiamondEntries);
+
+            // 繪製藍色播放頭垂直指示線（CTI）
             float playheadX = TimeToLaneX(_playbackTime, LeftHeaderWidth, laneWidth);
             if (playheadX >= LeftHeaderWidth && playheadX <= LeftHeaderWidth + laneWidth)
             {
@@ -514,10 +684,136 @@ namespace KeyframeToolPlugin
             GUI.EndScrollView();
         }
 
+        private void HandleMultiKeyDragging(float laneWidth)
+        {
+            Event e = Event.current;
+            if (!_isDraggingKeys || _selectedKeys.Count == 0) return;
+
+            if (e.type == EventType.MouseDrag)
+            {
+                float currentMouseTime = LaneXToTime(e.mousePosition.x, LeftHeaderWidth, laneWidth);
+
+                if (_isTimeStretching && _stretchInitialSpan > 0.001f)
+                {
+                    // Alt + 拖曳最外側關鍵影格：以另一端為錨點進行等比例時間伸縮
+                    float newOuterTime = Mathf.Clamp(currentMouseTime, 0f, _duration);
+                    float scaleFactor = Mathf.Abs(newOuterTime - _stretchAnchorTime) / _stretchInitialSpan;
+                    scaleFactor = Mathf.Max(0.05f, scaleFactor);
+
+                    foreach (var kvp in _dragInitialTimes)
+                    {
+                        KeyframeData kf = kvp.Key;
+                        float initT = kvp.Value;
+                        float offset = initT - _stretchAnchorTime;
+                        kf.Time = Mathf.Clamp(_stretchAnchorTime + offset * scaleFactor, 0f, _duration);
+                    }
+                }
+                else
+                {
+                    // 一般整批平移拖曳：限制整組不超出 [0, _duration]
+                    float rawDelta = currentMouseTime - _dragStartTime;
+                    float minInit = _dragInitialTimes.Values.Min();
+                    float maxInit = _dragInitialTimes.Values.Max();
+                    float clampedDelta = Mathf.Clamp(rawDelta, -minInit, _duration - maxInit);
+
+                    foreach (var kvp in _dragInitialTimes)
+                    {
+                        kvp.Key.Time = kvp.Value + clampedDelta;
+                    }
+                }
+
+                // 重新排序受影響軌道並即時刷新預覽
+                foreach (var root in _tracks.Values)
+                {
+                    foreach (var sub in root.SubTracks)
+                    {
+                        if (sub.Keyframes.Any(k => _selectedKeys.Contains(k)))
+                            sub.Keyframes.Sort((a, b) => a.Time.CompareTo(b.Time));
+                    }
+                }
+
+                if (_primarySelectedKey != null)
+                {
+                    LoadKeyframeToInputs(_primarySelectedKey);
+                    SetPlaybackTime(_primarySelectedKey.Time);
+                }
+                e.Use();
+            }
+        }
+
+        private void HandleMarqueeAndBackgroundClick(Rect zoneRect, List<RenderedDiamondInfo> renderedDiamonds)
+        {
+            Event e = Event.current;
+
+            // 在關鍵幀製作區域空白處按下左鍵（前面各菱形 hitRect 若命中已呼叫 e.Use()，所以走到這裡代表點在空白處）
+            if (e.type == EventType.MouseDown && e.button == 0 && zoneRect.Contains(e.mousePosition))
+            {
+                _isMarqueeSelecting = true;
+                _marqueeStartContent = e.mousePosition;
+                _marqueeCurrentContent = e.mousePosition;
+                _marqueeShiftAdditive = e.shift;
+
+                // 若未按 Shift，點擊空白處立即取消目前選取的關鍵幀
+                if (!e.shift)
+                {
+                    ClearKeySelection();
+                }
+                e.Use();
+            }
+            else if (_isMarqueeSelecting && e.type == EventType.MouseDrag)
+            {
+                _marqueeCurrentContent = new Vector2(
+                    Mathf.Clamp(e.mousePosition.x, zoneRect.x, zoneRect.xMax),
+                    Mathf.Clamp(e.mousePosition.y, zoneRect.y, zoneRect.yMax)
+                );
+
+                Rect selectionBox = GetNormalizedRect(_marqueeStartContent, _marqueeCurrentContent);
+                if (!_marqueeShiftAdditive)
+                    _selectedKeys.Clear();
+
+                foreach (var item in renderedDiamonds)
+                {
+                    if (selectionBox.Contains(item.Center))
+                    {
+                        _selectedKeys.Add(item.Key);
+                        _selectedSubTrack = item.SubTrack;
+                        _primarySelectedKey = item.Key;
+                    }
+                }
+
+                if (_primarySelectedKey != null)
+                    LoadKeyframeToInputs(_primarySelectedKey);
+
+                e.Use();
+            }
+
+            // 繪製藍色半透明框選矩形
+            if (_isMarqueeSelecting)
+            {
+                Rect box = GetNormalizedRect(_marqueeStartContent, _marqueeCurrentContent);
+                if (box.width > 2f || box.height > 2f)
+                {
+                    DrawRect(box, new Color(0.22f, 0.65f, 1f, 0.22f));
+                    DrawRect(new Rect(box.x, box.y, box.width, 1f), new Color(0.30f, 0.75f, 1f, 0.9f));
+                    DrawRect(new Rect(box.x, box.yMax - 1f, box.width, 1f), new Color(0.30f, 0.75f, 1f, 0.9f));
+                    DrawRect(new Rect(box.x, box.y, 1f, box.height), new Color(0.30f, 0.75f, 1f, 0.9f));
+                    DrawRect(new Rect(box.xMax - 1f, box.y, 1f, box.height), new Color(0.30f, 0.75f, 1f, 0.9f));
+                }
+            }
+        }
+
+        private Rect GetNormalizedRect(Vector2 p1, Vector2 p2)
+        {
+            float x = Mathf.Min(p1.x, p2.x);
+            float y = Mathf.Min(p1.y, p2.y);
+            float w = Mathf.Abs(p1.x - p2.x);
+            float h = Mathf.Abs(p1.y - p2.y);
+            return new Rect(x, y, w, h);
+        }
+
         // === After Effects 風格貝茲速度曲線編輯器（Graph Editor） ===
         private void DrawGraphEditorView(Rect outerRect, float laneWidth, bool dark)
         {
-            // 左側顯示當前選中的子軌道資訊與曲線說明
             Rect leftPanel = new Rect(outerRect.x, outerRect.y, LeftHeaderWidth, outerRect.height);
             DrawRect(leftPanel, dark ? new Color(0.16f, 0.17f, 0.19f) : new Color(0.88f, 0.88f, 0.90f));
 
@@ -528,7 +824,7 @@ namespace KeyframeToolPlugin
                 GUILayout.Label($"當前軌道: {_selectedSubTrack.DisplayName}");
                 GUILayout.Label($"關鍵影格數: {_selectedSubTrack.Keyframes.Count}");
                 GUILayout.Space(6);
-                GUILayout.Label("操作方式：\n• 點擊圖表中的關鍵影格節點（◆）\n• 拖曳橘色／藍色控制柄調整\n  出入加速度曲線（Ease-In / Ease-Out）\n• 縱軸代表兩點之間的進度（0% → 100%）");
+                GUILayout.Label("操作方式：\n• 點擊關鍵影格節點（◆）或按 F9 套用柔和漸變\n• 拖曳橘色／藍色控制柄調整出入加速度\n• 點擊空白處可取消選取");
             }
             else
             {
@@ -536,11 +832,9 @@ namespace KeyframeToolPlugin
             }
             GUILayout.EndArea();
 
-            // 右側曲線繪圖畫布
             Rect graphCanvas = new Rect(outerRect.x + LeftHeaderWidth, outerRect.y, laneWidth, outerRect.height);
             DrawRect(graphCanvas, dark ? new Color(0.10f, 0.10f, 0.12f) : new Color(0.82f, 0.82f, 0.85f));
 
-            // 繪製水平參考格線（0%, 25%, 50%, 75%, 100%）
             float padY = 24f;
             float plotHeight = graphCanvas.height - padY * 2f;
             for (int g = 0; g <= 4; g++)
@@ -550,7 +844,6 @@ namespace KeyframeToolPlugin
                 DrawRect(new Rect(graphCanvas.x, gy, graphCanvas.width, 1f), dark ? new Color(0.20f, 0.21f, 0.24f) : new Color(0.72f, 0.72f, 0.75f));
             }
 
-            // 繪製播放頭藍線
             float playheadX = TimeToLaneX(_playbackTime, graphCanvas.x, graphCanvas.width);
             if (playheadX >= graphCanvas.x && playheadX <= graphCanvas.xMax)
             {
@@ -562,7 +855,6 @@ namespace KeyframeToolPlugin
             var keys = _selectedSubTrack.Keyframes;
             Event e = Event.current;
 
-            // 繪製相鄰關鍵影格之間的貝茲插值曲線段
             for (int i = 0; i < keys.Count - 1; i++)
             {
                 KeyframeData k1 = keys[i];
@@ -570,8 +862,8 @@ namespace KeyframeToolPlugin
 
                 float x1 = TimeToLaneX(k1.Time, graphCanvas.x, graphCanvas.width);
                 float x2 = TimeToLaneX(k2.Time, graphCanvas.x, graphCanvas.width);
-                float yStart = graphCanvas.y + padY + plotHeight; // 0% 基準線
-                float yEnd = graphCanvas.y + padY;                // 100% 目標線
+                float yStart = graphCanvas.y + padY + plotHeight;
+                float yEnd = graphCanvas.y + padY;
 
                 int segments = 32;
                 Vector2 prevPt = new Vector2(x1, yStart);
@@ -590,8 +882,7 @@ namespace KeyframeToolPlugin
                     prevPt = curPt;
                 }
 
-                // 若選中了 k1 或 k2，繪製可拖曳的貝茲切線控制柄（Tangent Handles）
-                if (_selectedKey == k1 && k1.Easing != EasingMode.Hold)
+                if (_primarySelectedKey == k1 && k1.Easing != EasingMode.Hold)
                 {
                     float handleX = Mathf.Lerp(x1, x2, Mathf.Clamp(k1.OutInfluence, 0.05f, 0.95f));
                     float handleY = Mathf.Lerp(yStart, yEnd, Mathf.Clamp(k1.OutTangentValue, -0.2f, 1.2f));
@@ -617,7 +908,7 @@ namespace KeyframeToolPlugin
                     }
                 }
 
-                if (_selectedKey == k2 && k1.Easing != EasingMode.Hold)
+                if (_primarySelectedKey == k2 && k1.Easing != EasingMode.Hold)
                 {
                     float handleX = Mathf.Lerp(x2, x1, Mathf.Clamp(k2.InInfluence, 0.05f, 0.95f));
                     float handleY = Mathf.Lerp(yEnd, yStart, 1f - Mathf.Clamp(k2.InTangentValue, -0.2f, 1.2f));
@@ -644,7 +935,6 @@ namespace KeyframeToolPlugin
                 }
             }
 
-            // 繪製各關鍵影格節點（點選切換）
             for (int i = 0; i < keys.Count; i++)
             {
                 KeyframeData kf = keys[i];
@@ -652,17 +942,27 @@ namespace KeyframeToolPlugin
                 if (kx < graphCanvas.x || kx > graphCanvas.xMax) continue;
 
                 float ky = (i == 0) ? (graphCanvas.y + padY + plotHeight) : (graphCanvas.y + padY);
-                bool isSel = (_selectedKey == kf);
+                bool isSel = _selectedKeys.Contains(kf);
                 DrawDiamond(new Vector2(kx, ky), 6f, isSel ? new Color(0.25f, 0.78f, 1f) : Color.white);
 
                 Rect hit = new Rect(kx - 8f, ky - 8f, 16f, 16f);
                 if (e.type == EventType.MouseDown && e.button == 0 && hit.Contains(e.mousePosition))
                 {
-                    _selectedKey = kf;
-                    LoadKeyframeToInputs(kf);
+                    if (e.shift)
+                        ToggleKeyInSelection(_selectedSubTrack, kf);
+                    else
+                        SelectSingleKey(_selectedSubTrack, kf);
+
                     SetPlaybackTime(kf.Time);
                     e.Use();
                 }
+            }
+
+            // Graph Editor 空白處點擊取消選取
+            if (e.type == EventType.MouseDown && e.button == 0 && graphCanvas.Contains(e.mousePosition) && !e.shift)
+            {
+                ClearKeySelection();
+                e.Use();
             }
         }
 
@@ -672,7 +972,6 @@ namespace KeyframeToolPlugin
             if (k1.Easing == EasingMode.Linear) return u;
             if (k1.Easing == EasingMode.EaseInOut) return Mathf.SmoothStep(0f, 1f, u);
 
-            // CustomBezier：使用三次貝茲曲線（Cubic Bezier）計算 Y 值
             float p0 = 0f;
             float p1 = k1.OutTangentValue;
             float p2 = k2.InTangentValue;
@@ -744,7 +1043,7 @@ namespace KeyframeToolPlugin
                 {
                     _selectedRootTrack = null;
                     _selectedSubTrack = null;
-                    _selectedKey = null;
+                    ClearKeySelection();
                 }
                 return;
             }
@@ -761,7 +1060,7 @@ namespace KeyframeToolPlugin
             }
         }
 
-        private void DrawSubTrackRow(ObjectTrack root, SubTrack sub, Rect leftCell, Rect trackLane, bool dark, bool evenRow)
+        private void DrawSubTrackRow(ObjectTrack root, SubTrack sub, Rect leftCell, Rect trackLane, float laneWidth, bool dark, bool evenRow, List<RenderedDiamondInfo> renderedDiamonds)
         {
             bool isSelected = (_selectedSubTrack == sub);
             Color rowBg = isSelected
@@ -811,7 +1110,7 @@ namespace KeyframeToolPlugin
                     if (_selectedSubTrack == sub)
                     {
                         _selectedSubTrack = null;
-                        _selectedKey = null;
+                        ClearKeySelection();
                     }
                     return;
                 }
@@ -824,34 +1123,70 @@ namespace KeyframeToolPlugin
                 if (kx < trackLane.x - 6f || kx > trackLane.xMax + 6f) continue;
 
                 float ky = trackLane.y + trackLane.height * 0.5f;
+                Vector2 center = new Vector2(kx, ky);
+                renderedDiamonds.Add(new RenderedDiamondInfo { Center = center, SubTrack = sub, Key = kf });
+
                 Rect hitRect = new Rect(kx - 7f, ky - 7f, 14f, 14f);
 
-                bool isKeySelected = (_selectedKey == kf);
+                bool isKeySelected = _selectedKeys.Contains(kf);
                 Color diamondColor = isKeySelected
                     ? new Color(0.25f, 0.78f, 1f, 1f)
                     : (kf.Easing == EasingMode.CustomBezier ? new Color(1f, 0.78f, 0.30f, 1f) : new Color(0.86f, 0.87f, 0.90f, 1f));
 
-                DrawDiamond(new Vector2(kx, ky), 5.5f, diamondColor);
+                DrawDiamond(center, 5.5f, diamondColor);
 
                 if (e.type == EventType.MouseDown && e.button == 0 && hitRect.Contains(e.mousePosition))
                 {
                     _selectedRootTrack = root;
-                    _selectedSubTrack = sub;
-                    _selectedKey = kf;
-                    _draggingSubTrack = sub;
-                    _draggingKey = kf;
-                    LoadKeyframeToInputs(kf);
+
+                    if (e.shift)
+                    {
+                        // 按住 Shift：加選 / 減選關鍵影格
+                        ToggleKeyInSelection(sub, kf);
+                    }
+                    else
+                    {
+                        // 若點選的關鍵影格不在現有多重選取中，改為單選它；若已在多重選取中，保留整批選取以準備拖曳
+                        if (!_selectedKeys.Contains(kf))
+                            SelectSingleKey(sub, kf);
+                        else
+                        {
+                            _selectedSubTrack = sub;
+                            _primarySelectedKey = kf;
+                            LoadKeyframeToInputs(kf);
+                        }
+                    }
+
+                    // 啟動整批拖曳或 Alt + 拖曳最外側時間伸縮（Time-Stretch）
+                    if (_selectedKeys.Count > 0)
+                    {
+                        _isDraggingKeys = true;
+                        _dragStartTime = LaneXToTime(e.mousePosition.x, LeftHeaderWidth, laneWidth);
+                        _dragInitialTimes.Clear();
+                        foreach (var selKf in _selectedKeys)
+                            _dragInitialTimes[selKf] = selKf.Time;
+
+                        float minT = _dragInitialTimes.Values.Min();
+                        float maxT = _dragInitialTimes.Values.Max();
+                        float span = maxT - minT;
+
+                        if (e.alt && _selectedKeys.Count >= 2 && span > 0.001f)
+                        {
+                            // 判斷點擊的是較靠近最左側或最右側的關鍵影格，將另一端設為錨點
+                            bool clickedLeftSide = Mathf.Abs(kf.Time - minT) <= Mathf.Abs(kf.Time - maxT);
+                            _isTimeStretching = true;
+                            _stretchAnchorTime = clickedLeftSide ? maxT : minT;
+                            _stretchInitialSpan = span;
+                        }
+                        else
+                        {
+                            _isTimeStretching = false;
+                        }
+                    }
+
                     SetPlaybackTime(kf.Time);
                     e.Use();
                 }
-            }
-
-            if (_draggingKey != null && _draggingSubTrack == sub && e.type == EventType.MouseDrag)
-            {
-                _draggingKey.Time = LaneXToTime(e.mousePosition.x, trackLane.x, trackLane.width);
-                sub.Keyframes.Sort((a, b) => a.Time.CompareTo(b.Time));
-                SetPlaybackTime(_draggingKey.Time);
-                e.Use();
             }
         }
 
@@ -914,12 +1249,12 @@ namespace KeyframeToolPlugin
             GUILayout.BeginArea(new Rect(rect.x + 6, rect.y + 4, rect.width - 12, rect.height - 8));
             _inspectorScrollPos = GUILayout.BeginScrollView(_inspectorScrollPos);
 
-            GUILayout.Label("Keyframe & Curve Inspector", GUI.skin.box);
+            GUILayout.Label($"Inspector ({_selectedKeys.Count} selected)", GUI.skin.box);
 
-            if (_selectedKey != null && _selectedSubTrack != null)
+            if (_primarySelectedKey != null && _selectedSubTrack != null)
             {
                 GUILayout.Label($"Track: {_selectedSubTrack.DisplayName}");
-                GUILayout.Label($"Time: {_selectedKey.Time:F3} s");
+                GUILayout.Label($"Time: {_primarySelectedKey.Time:F3} s");
                 GUILayout.Space(4);
 
                 if (_selectedSubTrack.Type == SubTrackType.RootTransform || _selectedSubTrack.Type == SubTrackType.IKNode)
@@ -943,9 +1278,16 @@ namespace KeyframeToolPlugin
                 }
 
                 GUILayout.Space(4);
-                _selectedKey.Easing = (EasingMode)GUILayout.SelectionGrid((int)_selectedKey.Easing, new[] { "Linear", "EaseIO", "Hold", "Bezier" }, 4);
+                EasingMode prevEase = _primarySelectedKey.Easing;
+                EasingMode newEase = (EasingMode)GUILayout.SelectionGrid((int)prevEase, new[] { "Linear", "EaseIO", "Hold", "Bezier" }, 4);
+                if (newEase != prevEase)
+                {
+                    foreach (var selKf in _selectedKeys)
+                        selKf.Easing = newEase;
+                    EvaluateAllTracks(_playbackTime);
+                }
 
-                if (_selectedKey.Easing == EasingMode.CustomBezier)
+                if (_primarySelectedKey.Easing == EasingMode.CustomBezier)
                 {
                     GUILayout.Space(4);
                     GUILayout.Label("Bezier Tangent Handles (0~1):");
@@ -959,19 +1301,21 @@ namespace KeyframeToolPlugin
                 GUILayout.BeginHorizontal();
                 if (GUILayout.Button("套用數值"))
                 {
-                    ApplyInputsToKeyframe(_selectedKey);
+                    ApplyInputsToKeyframe(_primarySelectedKey);
                     EvaluateAllTracks(_playbackTime);
                 }
-                if (GUILayout.Button("刪除點", GUILayout.Width(65)))
+                if (GUILayout.Button($"刪除 ({_selectedKeys.Count})", GUILayout.Width(75)))
                 {
-                    _selectedSubTrack.Keyframes.Remove(_selectedKey);
-                    _selectedKey = null;
+                    foreach (var root in _tracks.Values)
+                        foreach (var sub in root.SubTracks)
+                            sub.Keyframes.RemoveAll(k => _selectedKeys.Contains(k));
+                    ClearKeySelection();
                 }
                 GUILayout.EndHorizontal();
             }
             else
             {
-                GUILayout.Label("快捷操作提示：\n• Alt + 滾輪：以游標為中心縮放時間軸\n• 拖曳底部橫條：平移檢視局部時間區段\n• 點擊頂部「📈 Graph」：進入貝茲曲線編輯器拖曳加速度控制柄");
+                GUILayout.Label("AE 操作快捷鍵一覽：\n• 軌道空白處拖曳：框選多顆關鍵幀\n• 軌道空白處單擊：取消目前選取\n• Shift + 點擊/框選：加選或減選\n• Alt + 拖曳最外側幀：時間伸縮 (Time-Stretch)\n• F9：套用柔和漸變 (Easy Ease)\n• Ctrl+C / V：跨軌道整批複製貼上\n• 拖曳視窗右下角：自由縮放視窗大小");
             }
 
             GUILayout.EndScrollView();
@@ -1158,9 +1502,7 @@ namespace KeyframeToolPlugin
                 existing.BlushRate = st.hohoAkaRate;
             }
 
-            _selectedSubTrack = sub;
-            _selectedKey = existing;
-            LoadKeyframeToInputs(existing);
+            SelectSingleKey(sub, existing);
         }
 
         private void LoadKeyframeToInputs(KeyframeData kf)
@@ -1353,7 +1695,7 @@ namespace KeyframeToolPlugin
             _tracks.Clear();
             _selectedRootTrack = null;
             _selectedSubTrack = null;
-            _selectedKey = null;
+            ClearKeySelection();
 
             if (data == null || !data.data.TryGetValue("xml", out object xmlObj) || !(xmlObj is string xmlStr))
                 return;
@@ -1463,6 +1805,21 @@ namespace KeyframeToolPlugin
         }
     }
 
+    public class RenderedDiamondInfo
+    {
+        public Vector2 Center;
+        public SubTrack SubTrack;
+        public KeyframeData Key;
+    }
+
+    public class ClipboardKeyEntry
+    {
+        public int RootObjectId;
+        public string SubTrackKey;
+        public float RelativeTimeOffset;
+        public KeyframeData Data;
+    }
+
     public class KeyframeToolSceneController : SceneCustomFunctionController
     {
         protected override void OnSceneSave()
@@ -1535,7 +1892,6 @@ namespace KeyframeToolPlugin
 
         public EasingMode Easing = EasingMode.Linear;
 
-        // 貝茲速度曲線控制柄參數（預設對應標準 Smooth Ease）
         public float OutInfluence = 0.33f;
         public float OutTangentValue = 0.0f;
         public float InInfluence = 0.33f;
